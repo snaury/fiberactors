@@ -13,15 +13,15 @@ Unfortunately they are either too low-level, or too tightly coupled, and don't t
 I want executors (or schedulers) to be separate from fibers. But what I want is a way to schedule cross-thread work efficiently and without allocation. One way would be to support it via these interfaces:
 
 ```c++
-class runnable : public intrusive_runnable_list_item {
+class IRunnable {
 public:
-    virtual runnable* run() noexcept = 0;
+    virtual IRunnable* Run() noexcept = 0;
 };
 
-class executor {
+class IExecutor {
 public:
-    virtual void post(runnable* r) = 0;
-    virtual void defer(runnable* r) = 0;
+    virtual void Post(IRunnable* r) = 0;
+    virtual void Defer(IRunnable* r) = 0;
 }
 ```
 
@@ -38,18 +38,18 @@ What some fiber-based frameworks seem to be missing, is that properly implemente
 I'm thinking of something like this:
 
 ```c++
-class task : ... {
+class TCurrentTask : ... {
 public:
     template<class Callback>
-    static void suspend(Callback&& callback);
+    static void Suspend(Callback&& callback);
 
     // Example of a suspending function
-    static void sleep(int microseconds);
+    static void Sleep(int microseconds);
 };
 
 // Example of a suspending function
-void task:sleep(int microseconds) {    
-    task::suspend([microseconds](runnable* r) noexcept -> runnable* {
+void TCurrentTask:Sleep(int microseconds) {
+    TCurrentTask::Suspend([microseconds](IRunnable* r) noexcept -> IRunnable* {
         // Fiber is now suspended and this lambda is running on a "system" stack
         if (microseconds <= 0) {
             // Example where we might decide to immediately resume without rescheduling
@@ -64,7 +64,7 @@ void task:sleep(int microseconds) {
 }
 ```
 
-The resume loop would provide some space for such callbacks, which are move-constructed there without allocating from the heap. After the current fiber switches back to the resume loop (the `runnable::run` implementation) the provided callback may decide whether it wants to resume immediately, schedule to resume later, or resume concurrently somewhere else (e.g. in another thread).
+The resume loop would provide some space for such callbacks, which are move-constructed there without allocating from the heap. After the current fiber switches back to the resume loop (the `IRunnable::Run` implementation) the provided callback may decide whether it wants to resume immediately, schedule to resume later, or resume concurrently somewhere else (e.g. in another thread).
 
 This is similar to how `await_suspend` works in C++ coroutines, and makes suspending entirely generic, supporting a wide variaty of scenarios, ones I cannot even think of yet. At the same time it would be usable without any need for locks most of the time.
 
@@ -87,11 +87,11 @@ void doWork() {
     // Stack variable used by multiple child tasks
     MyData data;
     // Perform two calculations in parallel with the same data
-    int result = with_task_group<int>([&](task_group<int>& g) {
-        g.add([&]{ return perform_one(data); });
-        g.add([&]{ return perform_two(data); });
+    int result = WithTaskGroup<int>([&](TTaskGroup<int>& g) {
+        g.Add([&]{ return perform_one(data); });
+        g.Add([&]{ return perform_two(data); });
         // Return the first result, the other task will be cancelled
-        return g.next();
+        return g.Next();
     });
     // We only return here when both child tasks have finished, destroying data is now safe
 }
@@ -123,33 +123,33 @@ public:
     }
 
 private:
-    actor_context context;
+    TActorContext context;
     int value_ = 0;
 };
 ```
 
-When current task suspends, current context needs to be released behind the scenes, and reacquired just before task is resumed. When reacquiring the context, we may block again, and I think it may be encoded using different implementations of runnables. I think this may be supported by generic support for hooks:
+When current task suspends, current context needs to be released behind the scenes, and reacquired just before the task is resumed. When reacquiring the context, we may block again, and I think it may be encoded using different implementations of runnables. I think this may be supported by generic support for hooks:
 
 ```
-class suspend_hook {
+class ISuspendHook {
 public:
-    // This method is called when the user calls task::suspend
-    // The last suspend_hook::suspend in the chain suspends the fiber
+    // This method is called when the user calls TCurrentTask::Suspend
+    // The last ISuspendHook::suspend in the chain suspends the fiber
     virtual void suspend() = 0;
 
     // This method is called after the fiber is suspended
-    // The last suspend_hook::suspended in the chain calls the user-provided callback
+    // The last ISuspendHook::suspended in the chain calls the user-provided callback
     // Initially `r` is the runnable that resumes the fiber, but may be wrapped
     // to perform additional actions before resuming and this wrapper may be
     // passed down the chain instead of the original.
-    virtual runnable* suspended(runnable* r) noexcept = 0;
+    virtual IRunnable* suspended(IRunnable* r) noexcept = 0;
 };
 
-class task {
+class TCurrentTask {
 public:
-    static suspend_hook* get_suspend_hook() noexcept;
-    static void set_suspend_hook(suspend_hook*) noexcept;
+    static ISuspendHook* GetSuspendHook() noexcept;
+    static void SetSuspendHook(ISuspendHook*) noexcept;
 }
 ```
 
-When `actor_context::lock()` successfully acquires the context, it could install itself at the top of suspend hooks, which would call the next hook with a wrapper runnable, restoring the context on the way back. However, since actor context is never nested, a generic implementation would also need to disable lower hooks, and could be more efficient as an integral part of the task suspend logic instead.
+When `TActorContext::lock()` successfully acquires the context, it could install itself at the top of suspend hooks, which would call the next hook with a wrapper runnable, restoring the context on the way back. However, since actor context is never nested, a generic implementation would also need to disable lower hooks, and could be more efficient as an integral part of the task suspend logic instead.
