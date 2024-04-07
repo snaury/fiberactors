@@ -8,6 +8,16 @@
 
 namespace fiberactors {
 
+    namespace {
+        inline IRunnable* GetNextPtr(IRunnable* r) {
+            return reinterpret_cast<IRunnable*>(r->Link[0].load(std::memory_order_relaxed));
+        }
+
+        inline void SetNextPtr(IRunnable* r, IRunnable* next) {
+            r->Link[0].store(reinterpret_cast<uintptr_t>(next), std::memory_order_relaxed);
+        }
+    }
+
     class TWorkStealingExecutor : public IExecutor {
     private:
         static constexpr size_t MaxLocalTasks = 256;
@@ -128,6 +138,10 @@ namespace fiberactors {
 
         IRunnable* NextTask(TThreadState* state) noexcept {
             // Check global queue periodically
+            // Note: for somewhat equal fairness between local and global tasks
+            // this should be equal to the number of running threads, but then
+            // the overhead of global queue checking is too large for a small
+            // number of threads.
             if (state->LocalProcessed >= 61) {
                 state->LocalProcessed = 0;
                 if (IRunnable* r = NextGlobalTask(state)) {
@@ -218,10 +232,10 @@ namespace fiberactors {
 
     private:
         void PushGlobalTask(IRunnable* r) {
-            r->Link[0].store(nullptr, std::memory_order_relaxed);
+            SetNextPtr(r, nullptr);
             std::unique_lock g(Mutex);
             if (GlobalQueueTail) {
-                GlobalQueueTail->Link[0].store(r, std::memory_order_relaxed);
+                SetNextPtr(GlobalQueueTail, r);
                 GlobalQueueTail = r;
             } else {
                 GlobalQueueHead = r;
@@ -231,9 +245,10 @@ namespace fiberactors {
         }
 
         void PushGlobalTaskBatch(IRunnable* head, IRunnable* tail) {
+            SetNextPtr(tail, nullptr);
             std::unique_lock g(Mutex);
             if (GlobalQueueTail) {
-                GlobalQueueTail->Link[0].store(head, std::memory_order_relaxed);
+                SetNextPtr(GlobalQueueTail, head);
                 GlobalQueueTail = tail;
             } else {
                 GlobalQueueHead = head;
@@ -259,7 +274,7 @@ namespace fiberactors {
             }
 
             IRunnable* r = GlobalQueueHead;
-            GlobalQueueHead = reinterpret_cast<IRunnable*>(r->Link[0].load(std::memory_order_relaxed));
+            GlobalQueueHead = GetNextPtr(r);
             if (!GlobalQueueHead) {
                 GlobalQueueTail = nullptr;
                 BlockedThreads.fetch_and(~FlagGlobalWork, std::memory_order_seq_cst);
@@ -340,9 +355,18 @@ namespace fiberactors {
                         PackHeadTail(head + n, tail), std::memory_order_relaxed))
                 {
                     for (uint32_t i = 1; i < n; ++i) {
-                        tasks[i-1]->Link[0].store(tasks[i], std::memory_order_relaxed);
+                        SetNextPtr(tasks[i-1], tasks[i]);
                     }
-                    tasks[n-1]->Link[0].store(nullptr, std::memory_order_relaxed);
+                    // Importantly, we must push these tasks to the end of the
+                    // global queue, and not the front, even though they would
+                    // have executed very soon. Local queue is usually checked
+                    // first, but we avoid global queue starvation by checking
+                    // it periodically even when local tasks are available. A
+                    // subtle point is that tasks currently in the local queue
+                    // may have been added unfairly, ahead of much older tasks
+                    // in the global queue. Pushing them to the front of the
+                    // global queue then may allow a bunch of rescheduling
+                    // tasks to completely starve the global queue.
                     PushGlobalTaskBatch(tasks[0], tasks[n-1]);
                     return true;
                 }

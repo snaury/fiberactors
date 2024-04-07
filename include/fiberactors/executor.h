@@ -4,6 +4,9 @@
 
 namespace fiberactors {
 
+    static_assert(sizeof(uintptr_t) == sizeof(void*),
+        "This library assumes uintptr_t is the same size as a pointer");
+
     /**
      * Used to represent type-erased units of work in the executor
      */
@@ -30,9 +33,10 @@ namespace fiberactors {
         /**
          * Used for bookkeeping (intrusive lists) without extra allocations
          *
-         * Intentionally uninitialized.
+         * Intentionally uninitialized. Uses uintptr_t instead of pointers,
+         * because special marker values may be used in certain situations.
          */
-        std::atomic<void*> Link[2];
+        std::atomic<uintptr_t> Link[2];
     };
 
     /**
@@ -68,6 +72,25 @@ namespace fiberactors {
         virtual bool Preempt() {
             return false;
         }
+    };
+
+    /**
+     * A runnable that is bound to a specific executor
+     */
+    class IRunnableWithExecutor : public IRunnable {
+    public:
+        explicit IRunnableWithExecutor(IExecutor* executor)
+            : Executor(executor)
+        {}
+
+    protected:
+        ~IRunnableWithExecutor() = default;
+
+    public:
+        /**
+         * The executor that this runnable is bound to.
+         */
+        IExecutor* const Executor;
     };
 
 } // namespace fiberactors
