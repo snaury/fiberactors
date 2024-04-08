@@ -7,15 +7,23 @@
 using namespace fiberactors;
 
 class alignas(128) ExecutorThroughputTask final
-    : public IRunnable
+    : public TRunnable
 {
+    static_assert(sizeof(TRunPtr) == 8);
+
 public:
     ExecutorThroughputTask(IExecutor* executor, bool usePost)
-        : executor(executor)
+        : TRunnable(MethodRunPtr<&ExecutorThroughputTask::Run>)
+        , executor(executor)
         , usePost(usePost)
     {}
 
-    IRunnable* Run() noexcept override {
+    uint64_t GetCount() noexcept {
+        return count_.exchange(0, std::memory_order_relaxed);
+    }
+
+private:
+    TRunnable* Run() noexcept {
         count_.fetch_add(1, std::memory_order_relaxed);
         if (usePost) {
             executor->Post(this);
@@ -23,10 +31,6 @@ public:
             executor->Defer(this);
         }
         return nullptr;
-    }
-
-    uint64_t GetCount() noexcept {
-        return count_.exchange(0, std::memory_order_relaxed);
     }
 
 private:

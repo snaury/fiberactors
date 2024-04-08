@@ -9,12 +9,12 @@
 namespace fiberactors {
 
     namespace {
-        inline IRunnable* GetNextPtr(IRunnable* r) {
-            return reinterpret_cast<IRunnable*>(r->Link[0].load(std::memory_order_relaxed));
+        inline TRunnable* GetNextPtr(TRunnable* r) {
+            return reinterpret_cast<TRunnable*>(r->LinkPtr[0].load(std::memory_order_relaxed));
         }
 
-        inline void SetNextPtr(IRunnable* r, IRunnable* next) {
-            r->Link[0].store(reinterpret_cast<uintptr_t>(next), std::memory_order_relaxed);
+        inline void SetNextPtr(TRunnable* r, TRunnable* next) {
+            r->LinkPtr[0].store(reinterpret_cast<uintptr_t>(next), std::memory_order_relaxed);
         }
     }
 
@@ -33,7 +33,7 @@ namespace fiberactors {
             // The only reason these are atomic is to make it possible to
             // atomically read them while racing with other threads. All
             // operations on these atomics are relaxed.
-            std::atomic<IRunnable*> LocalQueue[MaxLocalTasks];
+            std::atomic<TRunnable*> LocalQueue[MaxLocalTasks];
 
             // Packed head and tail indexes to simplify consistent load and cas
             std::atomic<uint64_t> LocalQueueHeadTail{ 0 };
@@ -79,7 +79,7 @@ namespace fiberactors {
             }
         }
 
-        void Post(IRunnable* r) override {
+        void Post(TRunnable* r) override {
             auto* state = LocalState;
             if (state && state->Executor == this) [[likely]] {
                 while (!PushLocalTask(state, r)) {
@@ -91,7 +91,7 @@ namespace fiberactors {
             }
         }
 
-        void Defer(IRunnable* r) override {
+        void Defer(TRunnable* r) override {
             auto* state = LocalState;
             if (state && state->Executor == this) [[likely]] {
                 while (!PushLocalTask(state, r)) {
@@ -126,17 +126,17 @@ namespace fiberactors {
 
             LocalState = state;
 
-            while (IRunnable* r = NextTask(state)) {
+            while (TRunnable* r = NextTask(state)) {
                 state->PreemptDeadline = TClock::now() + Settings.PreemptEvery;
                 do {
-                    r = r->Run();
+                    r = r->RunPtr(r);
                 } while (r);
             }
 
             LocalState = nullptr;
         }
 
-        IRunnable* NextTask(TThreadState* state) noexcept {
+        TRunnable* NextTask(TThreadState* state) noexcept {
             // Check global queue periodically
             // Note: for somewhat equal fairness between local and global tasks
             // this should be equal to the number of running threads, but then
@@ -144,17 +144,17 @@ namespace fiberactors {
             // number of threads.
             if (state->LocalProcessed >= 61) {
                 state->LocalProcessed = 0;
-                if (IRunnable* r = NextGlobalTask(state)) {
+                if (TRunnable* r = NextGlobalTask(state)) {
                     return r;
                 }
             }
 
-            if (IRunnable* r = NextLocalTask(state)) {
+            if (TRunnable* r = NextLocalTask(state)) {
                 state->LocalProcessed++;
                 return r;
             }
 
-            if (IRunnable* r = TryStealing(state)) {
+            if (TRunnable* r = TryStealing(state)) {
                 state->LocalProcessed++;
                 return r;
             }
@@ -163,14 +163,14 @@ namespace fiberactors {
             std::unique_lock g(Mutex);
 
             // Try to see if we have anything in the global queue
-            if (IRunnable* r = NextGlobalTaskLocked(state)) {
+            if (TRunnable* r = NextGlobalTaskLocked(state)) {
                 return r;
             }
 
             // Try to steal tasks as long as we have the FlagLocalWork bits set
             auto current = BlockedThreads.load(std::memory_order_seq_cst);
             while (current & FlagLocalWork) {
-                if (IRunnable* r = TryStealing(state)) {
+                if (TRunnable* r = TryStealing(state)) {
                     state->LocalProcessed++;
                     return r;
                 }
@@ -179,7 +179,7 @@ namespace fiberactors {
             }
 
             // Start waiting for more work to arrive
-            IRunnable* r = nullptr;
+            TRunnable* r = nullptr;
             bool notified = false;
             current = BlockedThreadsAdd(WaitingThreadsIncrement, std::memory_order_seq_cst);
             for (;;) {
@@ -231,7 +231,7 @@ namespace fiberactors {
         }
 
     private:
-        void PushGlobalTask(IRunnable* r) {
+        void PushGlobalTask(TRunnable* r) {
             SetNextPtr(r, nullptr);
             std::unique_lock g(Mutex);
             if (GlobalQueueTail) {
@@ -244,7 +244,7 @@ namespace fiberactors {
             WakeByGlobalTasksLocked();
         }
 
-        void PushGlobalTaskBatch(IRunnable* head, IRunnable* tail) {
+        void PushGlobalTaskBatch(TRunnable* head, TRunnable* tail) {
             SetNextPtr(tail, nullptr);
             std::unique_lock g(Mutex);
             if (GlobalQueueTail) {
@@ -268,12 +268,12 @@ namespace fiberactors {
             }
         }
 
-        IRunnable* NextGlobalTaskLocked(TThreadState* state) {
+        TRunnable* NextGlobalTaskLocked(TThreadState* state) {
             if (!GlobalQueueHead) {
                 return nullptr;
             }
 
-            IRunnable* r = GlobalQueueHead;
+            TRunnable* r = GlobalQueueHead;
             GlobalQueueHead = GetNextPtr(r);
             if (!GlobalQueueHead) {
                 GlobalQueueTail = nullptr;
@@ -296,7 +296,7 @@ namespace fiberactors {
             return r;
         }
 
-        IRunnable* NextGlobalTask(TThreadState* state) {
+        TRunnable* NextGlobalTask(TThreadState* state) {
             // Avoid locking the mutex when there is no work in the global queue
             if (BlockedThreads.load(std::memory_order_seq_cst) & FlagGlobalWork) {
                 std::unique_lock g(Mutex);
@@ -315,14 +315,14 @@ namespace fiberactors {
             return { uint32_t(value >> 32), uint32_t(value) };
         }
 
-        IRunnable* NextLocalTask(TThreadState* state) noexcept {
+        TRunnable* NextLocalTask(TThreadState* state) noexcept {
             auto head_tail = state->LocalQueueHeadTail.load(std::memory_order_relaxed);
             for (;;) {
                 auto [head, tail] = UnpackHeadTail(head_tail);
                 if (head == tail) {
                     return nullptr;
                 }
-                IRunnable* r = state->LocalQueue[head & TaskIndexMask].load(std::memory_order_relaxed);
+                TRunnable* r = state->LocalQueue[head & TaskIndexMask].load(std::memory_order_relaxed);
                 // Note: we don't need any synchronization here, because only the
                 // current thread ever writes to the local queue and reordering
                 // should be ok.
@@ -343,7 +343,7 @@ namespace fiberactors {
                 if (n < MaxLocalTasks) {
                     break;
                 }
-                IRunnable* tasks[MaxLocalTasks / 2];
+                TRunnable* tasks[MaxLocalTasks / 2];
                 n = MaxLocalTasks / 2;
                 for (uint32_t i = 0; i < n; ++i) {
                     tasks[i] = state->LocalQueue[(head + i) & TaskIndexMask].load(std::memory_order_relaxed);
@@ -375,7 +375,7 @@ namespace fiberactors {
             return false;
         }
 
-        bool PushLocalTask(TThreadState* state, IRunnable* r) noexcept {
+        bool PushLocalTask(TThreadState* state, TRunnable* r) noexcept {
             // Note: tail is only modified locally, no synchronization needed
             // And while head may be updated by a stealer, we only use it for
             // determining if there's enough capacity, nothing else.
@@ -401,7 +401,7 @@ namespace fiberactors {
             return tail - head;
         }
 
-        IRunnable* StealFromLocal(TThreadState* state, TThreadState* from) noexcept {
+        TRunnable* StealFromLocal(TThreadState* state, TThreadState* from) noexcept {
             auto our_head_tail = state->LocalQueueHeadTail.load(std::memory_order_relaxed);
             auto [our_head, our_tail] = UnpackHeadTail(our_head_tail);
             assert(our_head == our_tail);
@@ -443,7 +443,7 @@ namespace fiberactors {
             }
         }
 
-        IRunnable* TryStealing(TThreadState* state) noexcept {
+        TRunnable* TryStealing(TThreadState* state) noexcept {
             uint32_t pos = state->Random();
             for (size_t i = 0; i < Settings.MaxThreads; ++i, pos += 1) {
                 TThreadState* from = &ThreadStates[pos % Settings.MaxThreads];
@@ -491,8 +491,8 @@ namespace fiberactors {
 
         alignas(128) std::mutex Mutex;
         std::condition_variable WakeUp;
-        IRunnable* GlobalQueueHead{ nullptr };
-        IRunnable* GlobalQueueTail{ nullptr };
+        TRunnable* GlobalQueueHead{ nullptr };
+        TRunnable* GlobalQueueTail{ nullptr };
 
         std::atomic<uint32_t> BlockedThreads{ 0 };
 
